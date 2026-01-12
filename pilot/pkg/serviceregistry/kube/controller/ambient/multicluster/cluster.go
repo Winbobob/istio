@@ -128,6 +128,7 @@ func NewRemoteClusterCollections(
 	}
 }
 
+// checked
 func NewCluster(
 	id cluster.ID,
 	client kube.Client,
@@ -319,6 +320,7 @@ func (c *Cluster) SyncDidTimeout() bool {
 	return !c.initialSync.Load() && c.initialSyncTimeout.Load()
 }
 
+// checked
 // Stop closes the stop channel, if is safe to be called multi times.
 func (c *Cluster) Stop() {
 	select {
