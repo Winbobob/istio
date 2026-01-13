@@ -170,7 +170,7 @@ func (c *Cluster) GetStop() <-chan struct{} {
 func (c *Cluster) Run(localMeshConfig meshwatcher.WatcherCollection, debugger *krt.DebugHandler) {
 	// Check and see if this is a local cluster or not
 	if c.RemoteClusterCollections != nil {
-		log.Infof("Configuring cluster %s with existing informers", c.ID)
+		log.Infof("Configuring cluster %s with existing informers", c.ID) // hit
 		syncers := []krt.Syncer{
 			c.namespaces,
 			c.gateways,
