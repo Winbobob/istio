@@ -134,7 +134,6 @@ func (a *index) addRemoteConfig(name types.NamespacedName, data map[string][]byt
 			continue
 		}
 
-		logger.Infof("remotesecret.goL141 addRemoteConfig params - name: %s, data: %v", name, data) // hit
 		// Run returns after initializing the cluster's fields; it runs all of the expensive operations
 		// in a goroutine, so we can safely call it synchronously here.
 		remoteCluster.Run(a.meshConfig, debugger)
@@ -148,8 +147,6 @@ func (a *index) addRemoteConfig(name types.NamespacedName, data map[string][]byt
 		return fmt.Errorf("timed out waiting for remote clusters %#v to sync", addedClusters)
 	}
 
-	log.Info("remotesecret.goL155 addRemoteConfig completed")                  // hit
-	log.Infof("remotesecret.goL156 Number of remote clusters: %d", a.cs.Len()) // hit
 	return errs.ErrorOrNil()
 }
 
@@ -163,7 +160,6 @@ func (a *index) deleteSecret(secretKey string) {
 		a.deleteCluster(secretKey, cluster)
 	}
 
-	log.Infof("remotesecret.goL171 Number of remote clusters: %d", a.cs.Len())
 }
 
 func (a *index) deleteCluster(secretKey string, cluster *multicluster.Cluster) {
