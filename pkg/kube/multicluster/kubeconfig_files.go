@@ -49,10 +49,7 @@ func NewKubeconfigCollection(
 	}
 
 	collection := krtfiles.NewFileCollection[KubeconfigFile, KubeconfigFile](fw, func(k KubeconfigFile) *KubeconfigFile {
-		return &KubeconfigFile{
-			ClusterID:  k.ClusterID,
-			Kubeconfig: k.Kubeconfig,
-		}
+		return &k
 	}, opts...)
 
 	return collection, nil

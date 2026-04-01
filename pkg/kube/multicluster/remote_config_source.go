@@ -16,7 +16,6 @@ package multicluster
 
 import (
 	"sync"
-	"sync/atomic"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -83,7 +82,7 @@ type fileConfigSource struct {
 
 	mu         sync.RWMutex
 	collection krt.Collection[KubeconfigFile]
-	started    atomic.Bool
+	startOnce  sync.Once
 	// deferredHandlers stores AddEventHandler registrations made before Start() initializes the collection.
 	// They are registered against the collection once Start() finishes creating it.
 	deferredHandlers []func(types.NamespacedName, controllers.EventType)
@@ -96,32 +95,28 @@ func newFileConfigSource(root string) *fileConfigSource {
 }
 
 func (f *fileConfigSource) Start(stop <-chan struct{}) {
-	f.mu.Lock()
-	if f.started.Load() {
+	f.startOnce.Do(func() {
+		opts := krt.NewOptionsBuilder(stop, "remote-kubeconfig-file", nil)
+		collection, err := NewKubeconfigCollection(
+			f.root,
+			opts.WithName("RemoteKubeconfigs")...,
+		)
+		if err != nil {
+			log.Errorf("Failed to initialize file-based remote kubeconfigs from %q: %v; using an empty static collection instead. File-based discovery will not recover until istiod restarts.", f.root, err)
+			collection = krt.NewStaticCollection[KubeconfigFile](nil, nil, opts.WithName("RemoteKubeconfigs")...)
+		}
+
+		f.mu.Lock()
+		f.collection = collection
+		deferredHandlers := f.deferredHandlers
+		f.deferredHandlers = nil
 		f.mu.Unlock()
-		return
-	}
 
-	opts := krt.NewOptionsBuilder(stop, "remote-kubeconfig-file", nil)
-	collection, err := NewKubeconfigCollection(
-		f.root,
-		opts.WithName("RemoteKubeconfigs")...,
-	)
-	if err != nil {
-		log.Errorf("Failed to initialize file-based remote kubeconfigs from %q: %v", f.root, err)
-		collection = krt.NewStaticCollection[KubeconfigFile](nil, nil, opts.WithName("RemoteKubeconfigs")...)
-	}
-	f.collection = collection
-	deferredHandlers := f.deferredHandlers
-	f.deferredHandlers = nil
-	f.mu.Unlock()
-
-	// Register deferred handlers that arrived before the collection was initialized.
-	for _, handler := range deferredHandlers {
-		f.registerHandler(handler)
-	}
-
-	f.started.Store(true)
+		// Register deferred handlers that arrived before the collection was initialized.
+		for _, handler := range deferredHandlers {
+			registerHandler(collection, handler)
+		}
+	})
 }
 
 func (f *fileConfigSource) HasSynced() bool {
@@ -150,24 +145,26 @@ func (f *fileConfigSource) Get(key types.NamespacedName) *remoteConfig {
 }
 
 func (f *fileConfigSource) AddEventHandler(handler func(key types.NamespacedName, event controllers.EventType)) {
+	if handler == nil {
+		return
+	}
+
 	f.mu.Lock()
-	if f.collection == nil {
+	collection := f.collection
+	if collection == nil {
 		f.deferredHandlers = append(f.deferredHandlers, handler)
 		f.mu.Unlock()
 		return
 	}
 	f.mu.Unlock()
 
-	f.registerHandler(handler)
+	registerHandler(collection, handler)
 }
 
-func (f *fileConfigSource) registerHandler(handler func(key types.NamespacedName, event controllers.EventType)) {
+func registerHandler(collection krt.Collection[KubeconfigFile], handler func(key types.NamespacedName, event controllers.EventType)) {
 	if handler == nil {
 		return
 	}
-	f.mu.RLock()
-	collection := f.collection
-	f.mu.RUnlock()
 	if collection == nil {
 		return
 	}
