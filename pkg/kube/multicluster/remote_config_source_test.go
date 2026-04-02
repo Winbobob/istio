@@ -15,6 +15,7 @@
 package multicluster
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,7 +93,7 @@ func TestFileConfigSourceDuplicateClusterID(t *testing.T) {
 
 	retry.UntilOrFail(t, func() bool {
 		got := source.Get(types.NamespacedName{Name: "remote-1"})
-		return got != nil && string(got.Data["remote-1"]) == string(kubeconfigA)
+		return got != nil && bytes.Equal(got.Data["remote-1"], kubeconfigA)
 	}, retry.Timeout(2*time.Second))
 }
 
