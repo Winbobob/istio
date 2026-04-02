@@ -112,6 +112,8 @@ func TestRegisterHandlerEnqueuesOldAndNewClusterID(t *testing.T) {
 	})
 	tracker.WaitOrdered("add//cluster-a")
 
+	// Keep the hash stable only for this unit test so KRT emits an update event
+	// and we can verify registerHandler enqueues both the old and new cluster IDs.
 	collection.UpdateObject(KubeconfigFile{
 		ClusterID:      "cluster-b",
 		KubeconfigHash: "same-hash",
