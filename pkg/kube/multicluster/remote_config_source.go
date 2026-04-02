@@ -100,22 +100,22 @@ func newFileConfigSource(root string) *fileConfigSource {
 func (f *fileConfigSource) Start(stop <-chan struct{}) {
 	f.startOnce.Do(func() {
 		opts := krt.NewOptionsBuilder(stop, "remote-kubeconfig-file", nil)
-			collection, err := NewKubeconfigCollection(
+		collection, err := NewKubeconfigCollection(
+			f.root,
+			opts.WithName("RemoteKubeconfigs")...,
+		)
+		if err != nil {
+			log.Errorf(
+				"Failed to initialize file-backed remote kubeconfigs from %q: %v; "+
+					"using an empty static collection instead. "+
+					"File-backed remote cluster discovery will not recover until istiod restarts.",
 				f.root,
-				opts.WithName("RemoteKubeconfigs")...,
+				err,
 			)
-			if err != nil {
-				log.Errorf(
-					"Failed to initialize file-backed remote kubeconfigs from %q: %v; "+
-						"using an empty static collection instead. "+
-						"File-backed remote cluster discovery will not recover until istiod restarts.",
-					f.root,
-					err,
-				)
-				// Fall back to a synced dummy collection so the secret controller can
-				// continue starting even if the initial file-backed source setup fails.
-				collection = krt.NewStaticCollection[KubeconfigFile](nil, nil, opts.WithName("RemoteKubeconfigs")...)
-			}
+			// Fall back to a synced dummy collection so the secret controller can
+			// continue starting even if the initial file-backed source setup fails.
+			collection = krt.NewStaticCollection[KubeconfigFile](nil, nil, opts.WithName("RemoteKubeconfigs")...)
+		}
 
 		f.mu.Lock()
 		f.collection = collection
