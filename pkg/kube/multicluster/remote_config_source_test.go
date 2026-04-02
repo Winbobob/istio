@@ -24,13 +24,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/file"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
-// TestFileConfigSource verifies file-based kubeconfig add/delete events and sync behavior.
+// TestFileConfigSource verifies file-backed kubeconfig add/delete events and sync behavior.
 func TestFileConfigSource(t *testing.T) {
 	stop := test.NewStop(t)
 	root := t.TempDir()
@@ -39,12 +40,12 @@ func TestFileConfigSource(t *testing.T) {
 	tracker := assert.NewTracker[string](t)
 	// Register before Start() to verify deferred handlers are replayed once the collection is initialized.
 	source.AddEventHandler(func(key types.NamespacedName, event controllers.EventType) {
-		// NamespacedName.String() renders an empty namespace, so file-based events show up as "add//remote-1".
+		// NamespacedName.String() renders an empty namespace, so file-backed events show up as "add//remote-1".
 		tracker.Record(fmt.Sprintf("%s/%s", event.String(), key.String()))
 	})
 
 	assert.Equal(t, source.HasSynced(), false)
-	// Start initializes the file-based collection and begins watching the directory.
+	// Start initializes the file-backed collection and begins watching the directory.
 	source.Start(stop)
 	retry.UntilOrFail(t, source.HasSynced, retry.Timeout(2*time.Second))
 
@@ -53,7 +54,7 @@ func TestFileConfigSource(t *testing.T) {
 
 	kubeconfig := kubeconfigFileYAML("remote-1")
 	file.WriteOrFail(t, filepath.Join(root, "remote.yaml"), kubeconfig)
-	// File-based sources ignore namespaces, so events show up as "add//remote-1".
+	// file-backed sources ignore namespaces, so events show up as "add//remote-1".
 	tracker.WaitOrdered("add//remote-1")
 
 	got := source.Get(types.NamespacedName{Name: "remote-1", Namespace: ""})
@@ -64,4 +65,57 @@ func TestFileConfigSource(t *testing.T) {
 
 	assert.NoError(t, os.Remove(filepath.Join(root, "remote.yaml")))
 	tracker.WaitOrdered("delete//remote-1")
+}
+
+func TestFileConfigSourceDuplicateClusterID(t *testing.T) {
+	stop := test.NewStop(t)
+	root := t.TempDir()
+	source := newFileConfigSource(root)
+
+	source.Start(stop)
+	retry.UntilOrFail(t, source.HasSynced, retry.Timeout(2*time.Second))
+
+	kubeconfigA := kubeconfigFileYAMLWithToken("remote-1", "token-a")
+	kubeconfigB := kubeconfigFileYAMLWithToken("remote-1", "token-b")
+
+	fileA := filepath.Join(root, "a.yaml")
+	fileB := filepath.Join(root, "b.yaml")
+	file.WriteOrFail(t, fileA, kubeconfigA)
+	file.WriteOrFail(t, fileB, kubeconfigB)
+
+	retry.UntilOrFail(t, func() bool {
+		got := source.Get(types.NamespacedName{Name: "remote-1"})
+		return got != nil && got.Err != nil
+	}, retry.Timeout(2*time.Second))
+
+	assert.NoError(t, os.Remove(fileB))
+
+	retry.UntilOrFail(t, func() bool {
+		got := source.Get(types.NamespacedName{Name: "remote-1"})
+		return got != nil && string(got.Data["remote-1"]) == string(kubeconfigA)
+	}, retry.Timeout(2*time.Second))
+}
+
+func TestRegisterHandlerEnqueuesOldAndNewClusterID(t *testing.T) {
+	stop := test.NewStop(t)
+	collection := krt.NewStaticCollection[KubeconfigFile](nil, nil, krt.WithStop(stop))
+
+	tracker := assert.NewTracker[string](t)
+	registerHandler(collection, func(key types.NamespacedName, event controllers.EventType) {
+		tracker.Record(fmt.Sprintf("%s/%s", event.String(), key.String()))
+	})
+
+	collection.UpdateObject(KubeconfigFile{
+		ClusterID:      "cluster-a",
+		KubeconfigHash: "same-hash",
+		Kubeconfig:     []byte("a"),
+	})
+	tracker.WaitOrdered("add//cluster-a")
+
+	collection.UpdateObject(KubeconfigFile{
+		ClusterID:      "cluster-b",
+		KubeconfigHash: "same-hash",
+		Kubeconfig:     []byte("b"),
+	})
+	tracker.WaitOrdered("update//cluster-a", "update//cluster-b")
 }

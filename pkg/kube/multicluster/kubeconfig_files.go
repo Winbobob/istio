@@ -15,6 +15,8 @@
 package multicluster
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 
@@ -27,17 +29,18 @@ import (
 
 // KubeconfigFile represents a kubeconfig loaded from disk.
 type KubeconfigFile struct {
-	ClusterID  string
-	Kubeconfig []byte
+	ClusterID      string
+	KubeconfigHash string
+	Kubeconfig     []byte
 }
 
 func (k KubeconfigFile) ResourceName() string {
-	return k.ClusterID
+	return k.KubeconfigHash
 }
 
 // NewKubeconfigCollection builds a file-backed collection of kubeconfigs.
 // Each file is treated as a kubeconfig; its cluster ID is extracted from the
-// kubeconfig contents and used as the entry name.
+// kubeconfig contents and the kubeconfig hash is used as the entry name.
 func NewKubeconfigCollection(
 	root string,
 	opts ...krt.CollectionOption,
@@ -65,9 +68,15 @@ func parseKubeconfig(data []byte) ([]KubeconfigFile, error) {
 		return nil, err
 	}
 	return []KubeconfigFile{{
-		ClusterID:  clusterID,
-		Kubeconfig: data,
+		ClusterID:      clusterID,
+		KubeconfigHash: kubeconfigHash(data),
+		Kubeconfig:     data,
 	}}, nil
+}
+
+func kubeconfigHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // clusterIDFromKubeconfig selects a cluster ID in below order:

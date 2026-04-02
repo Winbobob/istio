@@ -138,6 +138,7 @@ func TestParseKubeconfig(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, len(files), tc.wantLength)
 			assert.Equal(t, files[0].ClusterID, tc.wantID)
+			assert.Equal(t, files[0].KubeconfigHash, kubeconfigHash(tc.data))
 			assert.Equal(t, files[0].Kubeconfig, tc.data)
 		})
 	}
@@ -157,11 +158,16 @@ func TestNewKubeconfigCollection(t *testing.T) {
 		tracker.Record(fmt.Sprintf("%s/%s", ev.Event.String(), ev.Latest().ResourceName()))
 	})
 
-	file.WriteOrFail(t, filepath.Join(root, "remote.yaml"), kubeconfigFileYAML("cluster-1"))
-	tracker.WaitOrdered("add/cluster-1")
+	kubeconfig := kubeconfigFileYAML("cluster-1")
+	file.WriteOrFail(t, filepath.Join(root, "remote.yaml"), kubeconfig)
+	tracker.WaitOrdered(fmt.Sprintf("add/%s", kubeconfigHash(kubeconfig)))
 }
 
 func kubeconfigFileYAML(clusterID string) []byte {
+	return kubeconfigFileYAMLWithToken(clusterID, "token")
+}
+
+func kubeconfigFileYAMLWithToken(clusterID, token string) []byte {
 	return []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
@@ -177,6 +183,6 @@ current-context: %s-context
 users:
 - name: %s-user
   user:
-    token: token
-`, clusterID, clusterID, clusterID, clusterID, clusterID, clusterID, clusterID))
+    token: %s
+`, clusterID, clusterID, clusterID, clusterID, clusterID, clusterID, clusterID, token))
 }

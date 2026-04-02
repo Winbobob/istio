@@ -15,6 +15,8 @@
 package multicluster
 
 import (
+	"fmt"
+	"sort"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +30,7 @@ import (
 
 type remoteConfig struct {
 	Data map[string][]byte
+	Err  error
 }
 
 // remoteConfigSource abstracts how remote cluster kubeconfigs are discovered
@@ -102,7 +105,9 @@ func (f *fileConfigSource) Start(stop <-chan struct{}) {
 			opts.WithName("RemoteKubeconfigs")...,
 		)
 		if err != nil {
-			log.Errorf("Failed to initialize file-based remote kubeconfigs from %q: %v; using an empty static collection instead. File-based discovery will not recover until istiod restarts.", f.root, err)
+			log.Errorf("Failed to initialize file-backed remote kubeconfigs from %q: %v; using an empty static collection instead. File-backed remote cluster discovery will not recover until istiod restarts.", f.root, err)
+			// Fall back to a synced dummy collection so the secret controller can
+			// continue starting even if the initial file-backed source setup fails.
 			collection = krt.NewStaticCollection[KubeconfigFile](nil, nil, opts.WithName("RemoteKubeconfigs")...)
 		}
 
@@ -136,8 +141,10 @@ func (f *fileConfigSource) Get(key types.NamespacedName) *remoteConfig {
 		return nil
 	}
 
-	// File-based remote kubeconfigs are keyed only by cluster ID, so the namespace is ignored here.
-	entry := collection.GetKey(key.Name)
+	entry, err := getClusterEntry(collection, key.Name)
+	if err != nil {
+		return &remoteConfig{Err: err}
+	}
 	if entry == nil {
 		return nil
 	}
@@ -161,6 +168,11 @@ func (f *fileConfigSource) AddEventHandler(handler func(key types.NamespacedName
 	registerHandler(collection, handler)
 }
 
+// registerHandler adapts KRT file collection events into controller queue keys.
+// KRT keys kubeconfigs by hash, but the controller reconciles by semantic cluster ID,
+// so updates enqueue old and new cluster IDs when they differ. This ensures a kubeconfig
+// file changing from cluster A to cluster B reconciles both keys so the old
+// cluster can be deleted and the new cluster can be added.
 func registerHandler(collection krt.Collection[KubeconfigFile], handler func(key types.NamespacedName, event controllers.EventType)) {
 	if handler == nil {
 		return
@@ -170,7 +182,47 @@ func registerHandler(collection krt.Collection[KubeconfigFile], handler func(key
 	}
 
 	collection.Register(func(ev krt.Event[KubeconfigFile]) {
-		item := ev.Latest()
-		handler(types.NamespacedName{Name: item.ClusterID, Namespace: ""}, ev.Event)
+		oldClusterID := ""
+		if ev.Old != nil {
+			oldClusterID = ev.Old.ClusterID
+		}
+		newClusterID := ""
+		if ev.New != nil {
+			newClusterID = ev.New.ClusterID
+		}
+
+		switch {
+		case oldClusterID != "" && newClusterID != "" && oldClusterID != newClusterID:
+			handler(types.NamespacedName{Name: oldClusterID, Namespace: ""}, ev.Event)
+			handler(types.NamespacedName{Name: newClusterID, Namespace: ""}, ev.Event)
+		case newClusterID != "":
+			handler(types.NamespacedName{Name: newClusterID, Namespace: ""}, ev.Event)
+		case oldClusterID != "":
+			handler(types.NamespacedName{Name: oldClusterID, Namespace: ""}, ev.Event)
+		}
 	})
+}
+
+// getClusterEntry resolves a file-backed kubeconfig by semantic cluster ID.
+// The underlying KRT collection is keyed by kubeconfig hash,
+// so multiple files may refer to the same cluster. In that case we report a
+// conflict so the controller logs it and keeps the existing cluster rather than
+// deleting it or switching to a conflicting config.
+func getClusterEntry(collection krt.Collection[KubeconfigFile], clusterID string) (*KubeconfigFile, error) {
+	var selected *KubeconfigFile
+	hashes := make([]string, 0, 2)
+	for _, item := range collection.List() {
+		if item.ClusterID != clusterID {
+			continue
+		}
+		if selected == nil {
+			selected = &item
+		}
+		hashes = append(hashes, item.KubeconfigHash)
+	}
+	if len(hashes) > 1 {
+		sort.Strings(hashes)
+		return nil, fmt.Errorf("multiple file-backed kubeconfigs found for cluster %q with hashes %v", clusterID, hashes)
+	}
+	return selected, nil
 }

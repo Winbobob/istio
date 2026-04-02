@@ -213,8 +213,9 @@ func NewController(opts ControllerOptions) *Controller {
 
 func (c *Controller) buildClustersCollection(optsBuilder krt.OptionsBuilder) {
 	// Wait for the remote config source to sync and mark the cluster store as ready.
-	// This is also done in Run() for the queue-based path, but this goroutine
-	// ensures MarkSynced happens even when Run() hasn't been called yet.
+	// Run() also waits on the same source before starting the queue; this goroutine
+	// separately gates the KRT-backed clusters collection on source sync.
+	// For the file-backed source, sync will not begin until Run() calls Start().
 	go func() {
 		if !kube.WaitForCacheSync("multicluster remote config source", c.stop, c.source.HasSynced) {
 			log.Errorf("Timed out waiting for remote config source to sync")
@@ -359,9 +360,14 @@ func (c *Controller) processItem(key types.NamespacedName) error {
 	log.Infof("processing remote config event for %s", key)
 	cfg := c.source.Get(key)
 	if cfg != nil {
-		log.Debugf("remote config %s exists in informer cache, processing it", key)
-		if err := c.addRemoteConfig(key, cfg); err != nil {
-			return fmt.Errorf("error adding remote config %s: %v", key, err)
+		if cfg.Err != nil {
+			// A conflicted file-backed source should not delete the existing cluster.
+			log.Errorf("remote config %s has conflicting file-backed kubeconfigs for the same cluster ID, keeping existing configuration: %v", key, cfg.Err)
+		} else {
+			log.Debugf("remote config %s exists in informer cache, processing it", key)
+			if err := c.addRemoteConfig(key, cfg); err != nil {
+				return fmt.Errorf("error adding remote config %s: %v", key, err)
+			}
 		}
 	} else {
 		log.Debugf("remote config %s does not exist in informer cache, deleting it", key)
