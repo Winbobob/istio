@@ -301,6 +301,12 @@ func buildTestFileSourceController(t *testing.T, root string) *Controller {
 	controller.ClientBuilder = TestingBuildClientsFromConfig
 	client.RunAndWait(stopCh)
 	assert.NoError(t, controller.Run(stopCh))
+	// Run() initializes the file-backed source asynchronously. Wait until the source
+	// has installed its watcher and the controller queue is running before mutating files,
+	// otherwise a write can land between the initial directory scan and fsnotify setup.
+	retry.UntilOrFail(t, func() bool {
+		return controller.source.HasSynced() && controller.queue.HasSynced()
+	}, retry.Timeout(2*time.Second))
 	return controller
 }
 
