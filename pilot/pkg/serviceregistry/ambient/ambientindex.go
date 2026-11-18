@@ -16,6 +16,7 @@ package ambient
 
 import (
 	"net/netip"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,6 +62,7 @@ type Index interface {
 	Run(stop <-chan struct{})
 	HasSynced() bool
 	model.AmbientIndexes
+	model.FederationAmbientIndex
 }
 
 var _ Index = &index{}
@@ -80,6 +82,10 @@ type workloadsCollection struct {
 	ByServiceKey             krt.Index[string, *model.WorkloadInfo]
 	ByOwningWaypointHostname krt.Index[NamespaceHostname, *model.WorkloadInfo]
 	ByOwningWaypointIP       krt.Index[networkAddress, *model.WorkloadInfo]
+	// NetworkGateways holds the workloads that represent network gateways
+	// (UID prefix "NetworkGateway/"), so AmbientNetworkGateways does not scan
+	// every workload.
+	NetworkGateways krt.Index[string, *model.WorkloadInfo]
 }
 
 type waypointsCollection struct {
@@ -125,6 +131,19 @@ type index struct {
 	mcController *multicluster.Controller
 	meshConfig   meshwatcher.WatcherCollection
 	stop         chan struct{}
+	builder      Builder
+
+	// localServices holds local-only services (pre-federation-merge).
+	// Used by outbound federation to avoid re-broadcasting federated data.
+	localServices krt.Collection[*model.ServiceInfo]
+
+	// localWorkloadsByServiceKey indexes local-only workloads by service key.
+	localWorkloadsByServiceKey krt.Index[string, *model.WorkloadInfo]
+
+	// localWorkloads holds local-only workloads (pre-federation-merge), the same
+	// collection localWorkloadsByServiceKey is built from. Used by outbound
+	// federation to register a per-workload change handler for incremental sync.
+	localWorkloads krt.Collection[*model.WorkloadInfo]
 }
 
 type FeatureFlags struct {
@@ -146,6 +165,10 @@ type Options struct {
 
 	Debugger               *krt.DebugHandler
 	MultiClusterController *multicluster.Controller
+
+	// FederationSource provides external service discovery from federated clusters.
+	// Services and workloads are merged into the ambient index via krt.JoinCollection.
+	FederationSource *FederationSource
 }
 
 func New(options Options) Index {
@@ -445,6 +468,7 @@ func New(options Options) Index {
 		ByServiceKey:             WorkloadServiceIndex,
 		ByOwningWaypointHostname: WorkloadWaypointIndexHostname,
 		ByOwningWaypointIP:       WorkloadWaypointIndexIP,
+		NetworkGateways:          newNetworkGatewayWorkloadIndex(Workloads),
 	}
 	a.services = servicesCollection{
 		Collection:               WorkloadServices,
@@ -715,6 +739,91 @@ func serviceOwningWaypointAddresses(s *model.ServiceInfo) []networkAddress {
 		out = append(out, networkAddress{network: wa.Network, ip: ip.String()})
 	}
 	return out
+}
+
+// AmbientNetworkGateways returns every network gateway known to the ambient index.
+// It merges two sources:
+//
+//   - a.networks.NetworkGateways: gateways built from Gateway resources in the
+//     config cluster and in clusters added through remote secrets. These carry
+//     Cluster, which EDS needs: selectGatewaysFromList (ep_filters.go) picks
+//     gateways matching both the endpoint's network and cluster, and falls back
+//     to network-only matches when there are none.
+//   - a.workloads.NetworkGateways: the "NetworkGateway/..." workloads in the
+//     workload collection. This is the only source of gateways learned through
+//     federation. It also contains the gateways from the first source, as
+//     workloads built by convertGateway. That round trip drops Cluster and Port,
+//     so each such gateway is returned twice: once complete and once with those
+//     fields empty. NetworkGatewaySet compares whole structs and keeps both.
+//     When the endpoint's cluster has its own gateway, only the complete copy
+//     matches on cluster, so the empty-Cluster copy is not selected.
+func (a *index) AmbientNetworkGateways() []model.NetworkGateway {
+	all := LookupAllNetworkGateway(krt.TestingDummyContext{}, a.networks.NetworkGateways)
+	gateways := make(model.NetworkGatewaySet, len(all))
+	for _, gw := range all {
+		gateways.Insert(gw.NetworkGateway)
+	}
+	for _, workload := range a.workloads.NetworkGateways.Lookup(networkGatewayIndexKey) {
+		if gw, ok := ambientNetworkGatewayFromWorkload(workload); ok {
+			gateways.Insert(gw)
+		}
+	}
+	return model.SortGateways(gateways.UnsortedList())
+}
+
+const networkGatewayIndexKey = "network-gateway"
+
+// newNetworkGatewayWorkloadIndex indexes the workloads AmbientNetworkGateways
+// reads, so it looks up the gateways instead of listing every workload. That
+// list is called while building EDS and grows with every remote service in a
+// large multi-network mesh.
+func newNetworkGatewayWorkloadIndex(workloads krt.Collection[*model.WorkloadInfo]) krt.Index[string, *model.WorkloadInfo] {
+	return krt.NewIndex(workloads, "networkGatewayWorkload", func(w *model.WorkloadInfo) []string {
+		if w.Workload == nil || !strings.HasPrefix(w.Workload.Uid, "NetworkGateway/") {
+			return nil
+		}
+		return []string{networkGatewayIndexKey}
+	})
+}
+
+func ambientNetworkGatewayFromWorkload(workload *model.WorkloadInfo) (model.NetworkGateway, bool) {
+	if workload == nil || workload.Workload == nil || !strings.HasPrefix(workload.Workload.Uid, "NetworkGateway/") {
+		return model.NetworkGateway{}, false
+	}
+
+	parts := strings.Split(workload.Workload.Uid, "/")
+	if len(parts) < 4 {
+		return model.NetworkGateway{}, false
+	}
+
+	hbonePort, err := strconv.ParseUint(parts[len(parts)-1], 10, 32)
+	if err != nil {
+		return model.NetworkGateway{}, false
+	}
+	if hbonePort == 0 {
+		return model.NetworkGateway{}, false
+	}
+
+	addr := workload.Workload.Hostname
+	if addr == "" && len(workload.Workload.Addresses) > 0 {
+		if parsed, ok := netip.AddrFromSlice(workload.Workload.Addresses[0]); ok {
+			addr = parsed.String()
+		}
+	}
+	if addr == "" {
+		return model.NetworkGateway{}, false
+	}
+
+	return model.NetworkGateway{
+		Network:   network.ID(workload.Workload.Network),
+		Cluster:   cluster.ID(workload.Workload.ClusterId),
+		Addr:      addr,
+		HBONEPort: uint32(hbonePort),
+		ServiceAccount: types.NamespacedName{
+			Namespace: workload.Workload.Namespace,
+			Name:      workload.Workload.ServiceAccount,
+		},
+	}, true
 }
 
 func (a *index) ServicesForWaypoint(key model.WaypointKey) []*model.ServiceInfo {

@@ -47,6 +47,16 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 	)
 	serviceControllers.AddRegistry(s.serviceEntryController)
 
+	// FederationSource holds the collections that bridge the sync protocol and
+	// the ambient index, so it must exist before ambient.New below.
+	var fedSource *ambient.FederationSource
+	if features.EnableFederation {
+		fedSource = ambient.NewFederationSource(s.clusterID, s.internalStop)
+		if err := s.initFederationSync(args, fedSource); err != nil {
+			return err
+		}
+	}
+
 	registered := sets.New[provider.ID]()
 	for _, r := range args.RegistryOptions.Registries {
 		serviceRegistry := provider.ID(r)
@@ -83,6 +93,7 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 			StatusNotifier:         args.RegistryOptions.KubeOptions.StatusWritingEnabled,
 			Debugger:               args.KrtDebugger,
 			MultiClusterController: s.multiclusterController,
+			FederationSource:       fedSource,
 			Flags: ambient.FeatureFlags{
 				DefaultAllowFromWaypoint:              features.DefaultAllowFromWaypoint,
 				EnableK8SServiceSelectWorkloadEntries: features.EnableK8SServiceSelectWorkloadEntries,

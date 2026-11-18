@@ -1703,6 +1703,18 @@ func Test_setCanonical(t *testing.T) {
 	}
 }
 
+func TestCloneServiceInfoPreservingMetadata(t *testing.T) {
+	t.Parallel()
+	original := model.ServiceInfo{
+		Service:              &workloadapi.Service{Name: "original"},
+		VisibilityConfigured: true,
+	}
+	cloned := cloneServiceInfoPreservingMetadata(&original)
+	assert.Equal(t, cloned.VisibilityConfigured, true)
+	cloned.Service.Name = "cloned"
+	assert.Equal(t, original.Service.Name, "original")
+}
+
 func TestServiceServices(t *testing.T) {
 	waypointAddr := &workloadapi.GatewayAddress{
 		Destination: &workloadapi.GatewayAddress_Hostname{

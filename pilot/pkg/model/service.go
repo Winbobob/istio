@@ -1025,9 +1025,48 @@ type ServiceDiscovery interface {
 	MCSServices() []MCSServiceInfo
 }
 
+// FederationAmbientIndex is the interface for federation integration with the ambient index.
+// It provides access to local service data needed by the federation sync protocol
+// for outbound broadcasting to remote clusters.
+//
+// Federation inbound data (remote services/workloads from the broker) is integrated
+// via the FederationSource passed to ambient.Options at construction time, rather than
+// through late-binding registration. This enables clean krt collection merging.
+type FederationAmbientIndex interface {
+	// AllGlobalServiceFromLocalClusterWithSANs returns global services with SubjectAltNames populated
+	// based on local workloads. This is used for federation sync so remote clusters know what
+	// identities to expect when connecting to workloads behind these services.
+	AllGlobalServiceFromLocalClusterWithSANs() []*ServiceInfo
+	// ServiceWithSANs returns a copy of the service with SubjectAltNames populated
+	// based on local workloads backing it.
+	ServiceWithSANs(svc *ServiceInfo) *ServiceInfo
+	// RegisterGlobalServiceHandler registers a callback for local global service changes.
+	// Only fires for services originating from this cluster, not federation data.
+	// On EventDelete, prev is set and curr is nil; on EventAdd, curr is set and prev is nil.
+	RegisterGlobalServiceHandler(f func(prev, curr *ServiceInfo, event Event))
+	// ServiceCapacity returns the total backend capacity for a service, computed
+	// as the sum of workload capacities (workloads with zero capacity count as 1).
+	// Used by federation to populate the Capacity field on WireServiceInfo so
+	// remote clusters can weight cross-cluster traffic proportionally.
+	ServiceCapacity(svc *ServiceInfo) uint32
+	// AllLocalWorkloadsForGlobalServices returns all local workloads that back
+	// global-scoped services. Used by single-network federation to send actual
+	// pod workloads instead of split-horizon data.
+	AllLocalWorkloadsForGlobalServices() []*WorkloadInfo
+	// RegisterGlobalWorkloadHandler registers a callback for changes to local
+	// workloads that back global-scoped services. It fires when a workload starts
+	// or stops being federation-eligible (backing >=1 global service), including
+	// when a service's scope flips global<->local. Only fires for workloads
+	// originating from this cluster, not federation data. Used by single-network
+	// federation to emit incremental workload deltas + deletions.
+	// prev and curr follow the same nil rules as RegisterGlobalServiceHandler.
+	RegisterGlobalWorkloadHandler(f func(prev, curr *WorkloadInfo, event Event))
+}
+
 type AmbientIndexes interface {
 	ServicesWithWaypoint(key string) []ServiceWaypointInfo
 	AddressInformation(addresses sets.String) ([]AddressInfo, sets.String)
+	AmbientNetworkGateways() []NetworkGateway
 	AdditionalPodSubscriptions(
 		proxy *Proxy,
 		allAddresses sets.String,
@@ -1140,6 +1179,10 @@ type NoopAmbientIndexes struct{}
 
 func (u NoopAmbientIndexes) AddressInformation(sets.String) ([]AddressInfo, sets.String) {
 	return nil, nil
+}
+
+func (u NoopAmbientIndexes) AmbientNetworkGateways() []NetworkGateway {
+	return nil
 }
 
 func (u NoopAmbientIndexes) AdditionalPodSubscriptions(

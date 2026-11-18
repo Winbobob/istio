@@ -29,11 +29,13 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/ambient/statusqueue"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	labelutil "istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
@@ -157,6 +159,10 @@ func (a *index) buildGlobalCollections(
 		opts,
 		false, // Don't precompute here; these will just get merged into the global collection later
 	)
+	// Store the local-only services collection for outbound federation sync.
+	// This prevents federation data from being re-broadcast.
+	a.localServices = LocalWorkloadServices
+
 	// All of this is local only, but we need to do it here so we don't have to rebuild collections in ambientindex
 	if features.EnableAmbientStatus {
 		serviceEntriesWriter := kclient.NewWriteClient[*networkingclient.ServiceEntry](localCluster.Client())
@@ -222,6 +228,20 @@ func (a *index) buildGlobalCollections(
 		opts.WithName("GlobalMergedServiceInfos")...,
 	)
 
+	// Merge federation services into the global merged services.
+	// Federation services represent services discovered from remote clusters through federation.
+	// They must be merged here (before SplitHorizonServices) so that SAN augmentation
+	// picks up federation workloads from different networks.
+	if options.FederationSource != nil {
+		fedSvcs := options.FederationSource.Services()
+
+		// Merge global + federation services. Global wins on key conflict.
+		GlobalMergedWorkloadServices = krt.JoinCollection(
+			[]krt.Collection[*model.ServiceInfo]{GlobalMergedWorkloadServices, fedSvcs},
+			opts.WithName("GlobalMergedWithFederationServices")...,
+		)
+	}
+
 	GlobalWorkloadServicesWithClusterByCluster := multicluster.NestedCollectionIndexByCluster(GlobalWorkloadServicesWithCluster)
 
 	LocalNamespacesInfo := krt.NewCollection(LocalNamespaces, func(ctx krt.HandlerContext, ns *v1.Namespace) *model.NamespaceInfo {
@@ -271,6 +291,30 @@ func (a *index) buildGlobalCollections(
 				}
 				return kclient.ToPatcher(workloadEntriesWriter), getConditions(info.Source.NamespacedName, localWorkloadEntryInformers)
 			})
+	}
+
+	// Index local+remote k8s-watched workloads by service key BEFORE merging federation workloads.
+	// Used by outbound federation (ServiceWithSANs) to avoid re-broadcasting federation SANs.
+	a.localWorkloadsByServiceKey = krt.NewIndex(GlobalWorkloads, "localService", func(o *model.WorkloadInfo) []string {
+		return maps.Keys(o.Workload.Services)
+	})
+	// Capture the pre-federation-merge workloads collection so outbound federation
+	// can register a per-workload change handler for incremental sync. Must be the
+	// same (pre-fedWls-join) collection localWorkloadsByServiceKey is built from.
+	a.localWorkloads = GlobalWorkloads
+
+	// Merge federation workloads into GlobalWorkloads so SplitHorizonServices can
+	// discover their SANs for mTLS identity verification. The coalescedWorkloads
+	// pipeline will log warnings about missing network gateways for federation
+	// networks (harmless: federation provides its own split-horizon workloads).
+	var fedWls krt.Collection[*model.WorkloadInfo]
+	if options.FederationSource != nil {
+		fedWls = options.FederationSource.Workloads()
+
+		GlobalWorkloads = krt.JoinCollection(
+			[]krt.Collection[*model.WorkloadInfo]{GlobalWorkloads, fedWls},
+			opts.With(krt.WithName("GlobalWithFederationWorkloads"), krt.WithJoinUnchecked())...,
+		)
 	}
 
 	GlobalWorkloadServiceIndex := krt.NewIndex(GlobalWorkloads, "service", func(o *model.WorkloadInfo) []string {
@@ -352,11 +396,44 @@ func (a *index) buildGlobalCollections(
 		return wi
 	}, opts.WithName("NetworkLocalWorkloads")...)
 
+	splitHorizonComponents := []krt.Collection[*model.WorkloadInfo]{
+		coalescedWorkloads,
+		networkLocalWorkloads,
+	}
+
+	// Merge federation workloads into splitHorizonComponents with dedup: only add the ones the other
+	// sub-collections do not already contribute. networkLocalWorkloads already contributes every
+	// NetworkGateway workload in any network plus every workload on the local network (in
+	// single-network that includes the federated remote workloads that share the local network id).
+	//
+	// Without the dedup, in multi-network the NetworkGateway workload is double-added, and in
+	// single-network the remote workloads that share the local network id are double-added. In the
+	// checked SplitHorizonWorkloads join that creates a race:
+	//   - if the workload is already held by both networkLocalWorkloads and fedWls when the join
+	//     processes the events, both events are neutralized: the lower-priority fedWls add is dropped
+	//     and the higher-priority networkLocalWorkloads add is converted to a no-op update
+	//     (pkg/kube/krt/join.go), which the batched event filter then skips (pkg/kube/krt/util.go),
+	//     so proxies like ztunnel never receive the workload.
+	//   - if only one collection has converged when the add is processed, the add is forwarded and
+	//     reaches ztunnel. Which case happens depends on goroutine scheduling, hence the race and its
+	//     per-replica behavior.
+	if fedWls != nil {
+		federationCrossNetworkWorkloads := krt.NewPointerCollection(fedWls, func(ctx krt.HandlerContext, wi *model.WorkloadInfo) *model.WorkloadInfo {
+			// NetworkGateway workloads and same-network workloads already arrive via
+			// networkLocalWorkloads; only cross-network non-gateway workloads need the direct path.
+			if strings.HasPrefix(wi.Workload.Uid, "NetworkGateway/") {
+				return nil
+			}
+			if wi.Workload.Network == GlobalNetworks.FetchLocalNetworkID(ctx).String() {
+				return nil
+			}
+			return wi
+		}, opts.WithName("FederationCrossNetworkWorkloads")...)
+		splitHorizonComponents = append(splitHorizonComponents, federationCrossNetworkWorkloads)
+	}
+
 	SplitHorizonWorkloads := krt.JoinCollection(
-		[]krt.Collection[*model.WorkloadInfo]{
-			coalescedWorkloads,
-			networkLocalWorkloads,
-		},
+		splitHorizonComponents,
 		opts.WithName("SplitHorizonWorkloads")...,
 	)
 	SplitHorizonWorkloads.RegisterBatch(krt.BatchedEventFilter(
@@ -371,6 +448,37 @@ func (a *index) buildGlobalCollections(
 	SplitHorizonWorkloadServiceIndex := krt.NewIndex(SplitHorizonWorkloads, "service", func(o *model.WorkloadInfo) []string {
 		return maps.Keys(o.Workload.Services)
 	})
+	SyntheticSplitHorizonWorkloads := krt.NewPointerCollection(
+		SplitHorizonWorkloads,
+		func(ctx krt.HandlerContext, wi *model.WorkloadInfo) *model.WorkloadInfo {
+			if wi.Workload == nil || len(wi.Workload.Services) == 0 {
+				return nil
+			}
+			if strings.HasPrefix(wi.Workload.Uid, "NetworkGateway/") {
+				return nil
+			}
+			if wi.Workload.Network == GlobalNetworks.FetchLocalNetworkID(ctx).String() {
+				return nil
+			}
+			return wi
+		},
+		opts.WithName("SyntheticSplitHorizonWorkloads")...,
+	)
+	SyntheticSplitHorizonWorkloadServiceShardIndex := krt.NewIndex(
+		SyntheticSplitHorizonWorkloads,
+		"service;shard",
+		func(o *model.WorkloadInfo) []string {
+			if o.Workload == nil {
+				return nil
+			}
+			res := make([]string, 0, len(o.Workload.Services))
+			shard := syntheticSplitHorizonShardKey(o)
+			for svc := range o.Workload.Services {
+				res = append(res, syntheticSplitHorizonServiceShardIndexKey(svc, shard))
+			}
+			return res
+		},
+	)
 	SplitHorizonWorkloadWaypointIndexHostname := krt.NewIndex(SplitHorizonWorkloads, "namespaceHostname", func(w *model.WorkloadInfo) []NamespaceHostname {
 		// Filter out waypoints.
 		if w.Labels[label.GatewayManaged.Name] == constants.ManagedGatewayMeshControllerLabel {
@@ -446,16 +554,7 @@ func (a *index) buildGlobalCollections(
 			}
 			sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
 
-			newSvcInfo := &model.ServiceInfo{
-				Service:            protomarshal.Clone(svc.Service),
-				PortNames:          svc.PortNames,
-				LabelSelector:      svc.LabelSelector,
-				Source:             svc.Source,
-				Waypoint:           svc.Waypoint,
-				Scope:              svc.Scope,
-				CreationTime:       svc.CreationTime,
-				DNSConnectStrategy: svc.DNSConnectStrategy,
-			}
+			newSvcInfo := cloneServiceInfoPreservingMetadata(svc)
 			newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
 			return precomputeService(newSvcInfo)
 		},
@@ -472,6 +571,42 @@ func (a *index) buildGlobalCollections(
 		},
 		PushXdsAddress(a.XDSUpdater, (*model.ServiceInfo).ResourceName, (*model.ServiceInfo).WaypointRef),
 	), false)
+	SyntheticSplitHorizonServiceShardEndpoints := krt.NewCollection(
+		SyntheticSplitHorizonWorkloadServiceShardIndex.AsCollection(opts.WithName("SyntheticSplitHorizonWorkloadServiceShardIndex")...),
+		func(ctx krt.HandlerContext, i krt.IndexObject[string, *model.WorkloadInfo]) *syntheticServiceShardEndpoints {
+			serviceKey, shard, ok := parseSyntheticSplitHorizonServiceShardIndexKey(i.Key)
+			if !ok {
+				log.Errorf("Invalid key %s for SyntheticSplitHorizonWorkloadServiceShardIndex", i.Key)
+				return nil
+			}
+			svc := krt.FetchOne(ctx, SplitHorizonServices, krt.FilterKey(serviceKey))
+			if svc == nil || *svc == nil || !shouldPublishSyntheticSplitHorizonEDS(*svc) {
+				return nil
+			}
+			namespace, hostname, found := strings.Cut(serviceKey, "/")
+			if !found {
+				log.Errorf("Invalid service key %s for SyntheticSplitHorizonWorkloadServiceShardIndex", serviceKey)
+				return nil
+			}
+			return &syntheticServiceShardEndpoints{
+				ServiceHostname: hostname,
+				Namespace:       namespace,
+				Shard:           shard,
+				Endpoints:       buildSyntheticSplitHorizonEndpoints(i.Objects, *svc),
+			}
+		},
+		opts.WithName("SyntheticSplitHorizonServiceShardEndpoints")...,
+	)
+	SyntheticSplitHorizonServiceShardEndpoints.RegisterBatch(func(events []krt.Event[syntheticServiceShardEndpoints]) {
+		for _, event := range events {
+			latest := event.Latest()
+			endpoints := latest.Endpoints
+			if event.Event == controllers.EventDelete {
+				endpoints = nil
+			}
+			a.XDSUpdater.EDSUpdate(latest.Shard, latest.ServiceHostname, latest.Namespace, endpoints)
+		}
+	}, false)
 
 	SplitHorizonServiceAddressIndex := krt.NewIndex(SplitHorizonServices, "serviceAddress", networkAddressFromService)
 	SplitHorizonServiceInfosByOwningWaypointHostname := krt.NewIndex(SplitHorizonServices, "namespaceHostname", func(s *model.ServiceInfo) []NamespaceHostname {
@@ -509,6 +644,7 @@ func (a *index) buildGlobalCollections(
 		ByServiceKey:             SplitHorizonWorkloadServiceIndex,
 		ByOwningWaypointHostname: SplitHorizonWorkloadWaypointIndexHostname,
 		ByOwningWaypointIP:       SplitHorizonWorkloadWaypointIndexIP,
+		NetworkGateways:          newNetworkGatewayWorkloadIndex(SplitHorizonWorkloads),
 	}
 
 	a.services = servicesCollection{
@@ -704,6 +840,131 @@ func wrapPointerObjectWithCluster[T any](clusterID cluster.ID) func(obj *T) krt.
 	return func(obj *T) krt.ObjectWithCluster[T] {
 		return krt.ObjectWithCluster[T]{ClusterID: clusterID, Object: obj}
 	}
+}
+
+type syntheticServiceShardEndpoints struct {
+	ServiceHostname string
+	Namespace       string
+	Shard           model.ShardKey
+	Endpoints       []*model.IstioEndpoint
+}
+
+func (s syntheticServiceShardEndpoints) ResourceName() string {
+	return syntheticSplitHorizonServiceShardIndexKey(s.Namespace+"/"+s.ServiceHostname, s.Shard)
+}
+
+func (s syntheticServiceShardEndpoints) Equals(other syntheticServiceShardEndpoints) bool {
+	if s.ServiceHostname != other.ServiceHostname || s.Namespace != other.Namespace || s.Shard != other.Shard {
+		return false
+	}
+	if len(s.Endpoints) != len(other.Endpoints) {
+		return false
+	}
+	for i := range s.Endpoints {
+		if !s.Endpoints[i].Equals(other.Endpoints[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldPublishSyntheticSplitHorizonEDS(svc *model.ServiceInfo) bool {
+	return svc.Service != nil && svc.Service.Waypoint != nil
+}
+
+func syntheticSplitHorizonShardKey(wl *model.WorkloadInfo) model.ShardKey {
+	return model.ShardKey{Cluster: cluster.ID(wl.Workload.ClusterId), Provider: provider.Kubernetes}
+}
+
+func syntheticSplitHorizonServiceShardIndexKey(serviceKey string, shard model.ShardKey) string {
+	return serviceKey + ";" + shard.Cluster.String()
+}
+
+func parseSyntheticSplitHorizonServiceShardIndexKey(key string) (string, model.ShardKey, bool) {
+	serviceKey, clusterName, found := strings.Cut(key, ";")
+	if !found {
+		return "", model.ShardKey{}, false
+	}
+	return serviceKey, model.ShardKey{Cluster: cluster.ID(clusterName), Provider: provider.Kubernetes}, true
+}
+
+func buildSyntheticSplitHorizonEndpoints(workloads []*model.WorkloadInfo, svc *model.ServiceInfo) []*model.IstioEndpoint {
+	serviceKey := svc.ResourceName()
+	endpoints := make([]*model.IstioEndpoint, 0, len(workloads))
+	for _, wl := range workloads {
+		if wl.Workload == nil {
+			continue
+		}
+		ports := wl.Workload.Services[serviceKey]
+		if ports == nil {
+			continue
+		}
+		address := syntheticSplitHorizonEndpointAddress(wl, svc)
+		for _, port := range ports.Ports {
+			portName, ok := svc.PortNames[int32(port.ServicePort)]
+			if !ok || portName.PortName == "" {
+				continue
+			}
+			endpointPort := port.TargetPort
+			if endpointPort == 0 {
+				endpointPort = port.ServicePort
+			}
+			endpoints = append(endpoints, &model.IstioEndpoint{
+				Addresses:       []string{address},
+				EndpointPort:    endpointPort,
+				ServicePortName: portName.PortName,
+				Network:         network.ID(wl.Workload.Network),
+				Locality: model.Locality{
+					ClusterID: cluster.ID(wl.Workload.ClusterId),
+				},
+				Labels:         maps.Clone(wl.Labels),
+				ServiceAccount: wl.Workload.ServiceAccount,
+				TLSMode:        model.IstioMutualTLSModeLabel,
+				WorkloadName:   wl.Workload.Name,
+				Namespace:      wl.Workload.Namespace,
+				HostName:       svc.Service.Hostname,
+				HealthStatus:   model.Healthy,
+				// LbWeight for waypoints (Envoy) is the split-horizon
+				// workload's Capacity, the remote cluster's backend count for
+				// this service, which ztunnel already weights by.
+				LbWeight: wl.Workload.GetCapacity().GetValue(),
+			})
+		}
+	}
+	return slices.SortBy(endpoints, func(ep *model.IstioEndpoint) string {
+		return ep.ServicePortName + ";" + ep.FirstAddressOrNil() + ";" + ep.Locality.ClusterID.String()
+	})
+}
+
+func syntheticSplitHorizonEndpointAddress(wl *model.WorkloadInfo, svc *model.ServiceInfo) string {
+	for _, raw := range wl.Workload.Addresses {
+		if addr, ok := netip.AddrFromSlice(raw); ok {
+			return addr.String()
+		}
+	}
+	for _, addr := range svc.Service.Addresses {
+		if addr.Network != wl.Workload.Network {
+			continue
+		}
+		if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+			return parsed.String()
+		}
+	}
+	for _, addr := range svc.Service.Addresses {
+		if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+			return parsed.String()
+		}
+	}
+	if gateway := wl.Workload.GetNetworkGateway(); gateway != nil {
+		if addr := gateway.GetAddress(); addr != nil {
+			if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+				return parsed.String()
+			}
+		}
+	}
+	// Class E reserved range (240.0.0.0/4) — never routed on the internet.
+	// EDS requires an address, but ztunnel routes via NetworkGateway, so this is never connected to.
+	return "240.0.0.1"
 }
 
 func (a *index) createSplitHorizonWorkload(

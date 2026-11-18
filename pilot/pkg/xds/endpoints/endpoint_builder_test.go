@@ -17,6 +17,7 @@ package endpoints
 import (
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -28,6 +29,8 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
+	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
@@ -36,6 +39,7 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/workloadapi"
 )
@@ -144,7 +148,9 @@ func TestWeightedWaypointEndpointsFailsClosed(t *testing.T) {
 // mockAmbientIndex is a test implementation of AmbientIndexes that returns mock service info
 type mockAmbientIndex struct {
 	model.NoopAmbientIndexes
-	serviceInfos []*model.ServiceInfo
+	serviceInfos    []*model.ServiceInfo
+	ambientGateways []model.NetworkGateway
+	gatewayCalls    atomic.Int32
 }
 
 func (m *mockAmbientIndex) ServiceInfo(key string) *model.ServiceInfo {
@@ -155,6 +161,11 @@ func (m *mockAmbientIndex) ServiceInfo(key string) *model.ServiceInfo {
 		}
 	}
 	return nil
+}
+
+func (m *mockAmbientIndex) AmbientNetworkGateways() []model.NetworkGateway {
+	m.gatewayCalls.Add(1)
+	return m.ambientGateways
 }
 
 // MockDiscovery is an in-memory ServiceDiscover with mock services
@@ -868,4 +879,239 @@ func TestBuildClusterLoadAssignment_InferenceServicePortFiltering(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestBuildClusterLoadAssignment_AmbientUsesAmbientNetworkGateways(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientWaypointMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientIngressMultiNetwork, true)
+
+	svc := &model.Service{
+		Hostname: "example.ns.svc.cluster.local",
+		Attributes: model.ServiceAttributes{
+			Name:      "example",
+			Namespace: "ns",
+		},
+		Ports: model.PortList{{Port: 80, Protocol: protocol.HTTP, Name: "http"}},
+	}
+	globalSvc := makeService("ns", "example.ns.svc.cluster.local", model.Global)
+
+	endpointIndex := model.NewEndpointIndex(model.NewXdsCache())
+	shards, _ := endpointIndex.GetOrCreateEndpointShard("example.ns.svc.cluster.local", "ns")
+	shards.Lock()
+	shards.Shards[model.ShardKey{Cluster: "cluster2"}] = []*model.IstioEndpoint{{
+		Addresses:       []string{"20.0.0.1"},
+		Network:         "network2",
+		Locality:        model.Locality{ClusterID: "cluster2"},
+		ServicePortName: "http",
+		EndpointPort:    8080,
+		HostName:        "example.ns.svc.cluster.local",
+		Namespace:       "ns",
+		TLSMode:         model.IstioMutualTLSModeLabel,
+	}}
+	shards.Unlock()
+
+	tests := []struct {
+		name        string
+		proxy       *model.Proxy
+		direction   model.TrafficDirection
+		subset      string
+		clusterName string
+		preferHBONE bool
+	}{
+		{
+			name: "waypoint proxy",
+			proxy: &model.Proxy{
+				Type: model.Waypoint,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+			},
+			direction:   model.TrafficDirectionOutbound,
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, 80),
+		},
+		{
+			name: "waypoint inbound-vip cluster",
+			proxy: &model.Proxy{
+				Type: model.Waypoint,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+			},
+			direction:   model.TrafficDirectionInboundVIP,
+			subset:      "http",
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionInboundVIP, "http", svc.Hostname, 80),
+		},
+		{
+			name: "ingress gateway proxy",
+			proxy: &model.Proxy{
+				Type: model.Router,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayControllerLabel},
+			},
+			direction:   model.TrafficDirectionOutbound,
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, 80),
+			// Ingress uses legacy mTLS for an mTLS-capable endpoint unless HBONE is
+			// preferred, and the ambient gateway only has an HBONE port.
+			preferHBONE: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.PreferHBONESend, tt.preferHBONE)
+			env := model.NewEnvironment()
+			configStore := model.NewFakeStore()
+			env.ConfigStore = configStore
+			env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})
+			env.NetworksWatcher = meshwatcher.NewFixedNetworksWatcher(nil)
+			env.ServiceDiscovery = memory.NewServiceDiscovery()
+			if err := env.InitNetworksManager(xdsfake.NewFakeXDS()); err != nil {
+				t.Fatal(err)
+			}
+			env.ServiceDiscovery = &localServiceDiscovery{
+				services: []*model.Service{svc},
+			}
+			env.VirtualServiceController = model.NewVirtualServiceController(
+				configStore,
+				model.VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler},
+				env.Watcher,
+			)
+			stop := test.NewStop(t)
+			go configStore.Run(stop)
+			go env.VirtualServiceController.Run(stop)
+			kube.WaitForCacheSync("test", stop, configStore.HasSynced)
+			kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+			env.AmbientIndexes = &mockAmbientIndex{
+				serviceInfos: []*model.ServiceInfo{globalSvc},
+				ambientGateways: []model.NetworkGateway{{
+					Network:   "network2",
+					Cluster:   "cluster2",
+					Addr:      "2.2.2.2",
+					HBONEPort: 15008,
+				}},
+			}
+			env.Init()
+
+			push := model.NewPushContext()
+			push.InitContext(env, nil, nil)
+			env.SetPushContext(push)
+			tt.proxy.SetSidecarScope(push)
+
+			builder := NewCDSEndpointBuilder(
+				tt.proxy, push,
+				tt.clusterName,
+				tt.direction, tt.subset, "example.ns.svc.cluster.local", 80,
+				svc, nil,
+			)
+			cla := builder.BuildClusterLoadAssignment(endpointIndex)
+			if cla.ClusterName != tt.clusterName {
+				t.Fatalf("expected cluster name %q, got %q", tt.clusterName, cla.ClusterName)
+			}
+			xdstest.CompareEndpointsOrFail(t, cla.ClusterName, cla.Endpoints, []xdstest.LocLbEpInfo{{
+				LbEps:  []xdstest.LbEpInfo{{Address: "2.2.2.2", Weight: 1}},
+				Weight: 1,
+			}})
+		})
+	}
+}
+
+// AmbientNetworkGateways walks the ambient index, so an EDS build must look it
+// up once, not once per endpoint.
+func TestBuildClusterLoadAssignment_AmbientGatewaysLookedUpOncePerBuild(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientWaypointMultiNetwork, true)
+
+	svc := &model.Service{
+		Hostname:   "example.ns.svc.cluster.local",
+		Attributes: model.ServiceAttributes{Name: "example", Namespace: "ns"},
+		Ports:      model.PortList{{Port: 80, Protocol: protocol.HTTP, Name: "http"}},
+	}
+	globalSvc := makeService("ns", "example.ns.svc.cluster.local", model.Global)
+
+	const remoteEndpoints = 5
+	endpointIndex := model.NewEndpointIndex(model.NewXdsCache())
+	shards, _ := endpointIndex.GetOrCreateEndpointShard("example.ns.svc.cluster.local", "ns")
+	shardKey := model.ShardKey{Cluster: "cluster2"}
+	shards.Lock()
+	for i := range remoteEndpoints {
+		shards.Shards[shardKey] = append(shards.Shards[shardKey], &model.IstioEndpoint{
+			Addresses:       []string{fmt.Sprintf("20.0.0.%d", i+1)},
+			Network:         "network2",
+			Locality:        model.Locality{ClusterID: "cluster2"},
+			ServicePortName: "http",
+			EndpointPort:    8080,
+			HostName:        "example.ns.svc.cluster.local",
+			Namespace:       "ns",
+			TLSMode:         model.IstioMutualTLSModeLabel,
+		})
+	}
+	shards.Unlock()
+
+	env := model.NewEnvironment()
+	configStore := model.NewFakeStore()
+	env.ConfigStore = configStore
+	env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})
+	env.NetworksWatcher = meshwatcher.NewFixedNetworksWatcher(nil)
+	env.ServiceDiscovery = memory.NewServiceDiscovery()
+	if err := env.InitNetworksManager(xdsfake.NewFakeXDS()); err != nil {
+		t.Fatal(err)
+	}
+	env.ServiceDiscovery = &localServiceDiscovery{services: []*model.Service{svc}}
+	ambient := &mockAmbientIndex{
+		serviceInfos: []*model.ServiceInfo{globalSvc},
+		ambientGateways: []model.NetworkGateway{{
+			Network: "network2", Cluster: "cluster2", Addr: "2.2.2.2", HBONEPort: 15008,
+		}},
+	}
+	env.AmbientIndexes = ambient
+	env.VirtualServiceController = model.NewVirtualServiceController(
+		configStore, model.VSControllerOptions{KrtDebugger: krt.GlobalDebugHandler}, env.Watcher)
+	stop := test.NewStop(t)
+	go configStore.Run(stop)
+	go env.VirtualServiceController.Run(stop)
+	kube.WaitForCacheSync("test", stop, configStore.HasSynced)
+	kube.WaitForCacheSync("test", stop, env.VirtualServiceController.HasSynced)
+	env.Init()
+
+	push := model.NewPushContext()
+	push.InitContext(env, nil, nil)
+	env.SetPushContext(push)
+	proxy := &model.Proxy{
+		Type: model.Waypoint,
+		Metadata: &model.NodeMetadata{
+			Namespace: "ns",
+			Network:   network.ID("network1"),
+			ClusterID: cluster.ID("cluster1"),
+		},
+		Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+	}
+	proxy.SetSidecarScope(push)
+
+	clusterName := model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, 80)
+	builder := NewCDSEndpointBuilder(proxy, push, clusterName,
+		model.TrafficDirectionOutbound, "", "example.ns.svc.cluster.local", 80, svc, nil)
+
+	ambient.gatewayCalls.Store(0)
+	cla := builder.BuildClusterLoadAssignment(endpointIndex)
+	if got := ambient.gatewayCalls.Load(); got != 1 {
+		t.Fatalf("AmbientNetworkGateways called %d times for %d endpoints, want 1", got, remoteEndpoints)
+	}
+	// All remote endpoints collapse into the one gateway, weighted by their count.
+	xdstest.CompareEndpointsOrFail(t, cla.ClusterName, cla.Endpoints, []xdstest.LocLbEpInfo{{
+		LbEps:  []xdstest.LbEpInfo{{Address: "2.2.2.2", Weight: remoteEndpoints}},
+		Weight: remoteEndpoints,
+	}})
 }

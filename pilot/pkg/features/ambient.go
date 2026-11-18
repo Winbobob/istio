@@ -15,6 +15,8 @@
 package features
 
 import (
+	"time"
+
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	"istio.io/istio/pkg/env"
@@ -97,6 +99,28 @@ var (
 		"If enabled, ambient Address updates only trigger pushes for waypoints whose attached services or workloads changed, "+
 			"and are skipped entirely for sidecar and gateway proxies. If disabled, every Address update triggers a "+
 			"full LDS/CDS/EDS push to all waypoints and an RDS push to all proxies.").Get()
+
+	// --- Federation: pub/sub multi-cluster sync ---
+
+	EnableFederation = registerAmbient("PILOT_ENABLE_FEDERATION", false, false,
+		"If enabled, istiod uses a pub/sub broker to synchronize ambient global services with peer istiod instances.")
+
+	FederationBrokerAddress = env.Register("PILOT_FEDERATION_BROKER_ADDRESS", "",
+		"Address of the pub/sub broker used for federation, in the transport's own format "+
+			"(for example a URL, a host:port list, or a namespace FQDN). Must not contain credentials.").Get()
+
+	FederationSnapshotInterval = env.Register("PILOT_FEDERATION_SNAPSHOT_INTERVAL", 5*time.Minute,
+		"How often the leader publishes a full-sync snapshot. Peers use it to recover missed or dropped incremental updates, "+
+			"as a liveness signal for shard expiry, and to load state after an istiod restart.").Get()
+
+	// Shard liveness and expiry.
+
+	FederationShardExpiry = env.Register("PILOT_FEDERATION_SHARD_EXPIRY", time.Duration(0),
+		"Duration after which a remote cluster's shard is tombstoned if no accepted message has been received. "+
+			"Defaults to max(3*SnapshotInterval, 15m) when zero. Set negative to disable expiry entirely.").Get()
+
+	FederationShardSweepInterval = env.Register("PILOT_FEDERATION_SHARD_SWEEP_INTERVAL", 1*time.Minute,
+		"How often to check for expired remote cluster shards.").Get()
 
 	EnableWdsDryRunAuthzPol = registerAmbient("AMBIENT_ENABLE_DRY_RUN_AUTHORIZATION_POLICY", false, false,
 		"If enabled, ztunnel will be configured with dry-run authorizationPolicies. "+

@@ -85,6 +85,15 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 		scaleFactor = 1
 	}
 
+	// The ambient gateway list is the same for every endpoint in this build, so
+	// look it up once here and pass it to selectNetworkGateways. This keeps EDS
+	// builds fast in large multi-network meshes, where a cluster can have many
+	// remote endpoints.
+	var ambientGws []model.NetworkGateway
+	if features.EnableAmbientMultiNetwork && !isSidecarProxy(b.proxy) {
+		ambientGws = b.push.AmbientNetworkGateways()
+	}
+
 	// Go through all cluster endpoints and add those with the same network as the sidecar
 	// to the result. Also count the number of endpoints per each remote network while
 	// iterating so that it can be used as the weight for the gateway endpoint
@@ -174,7 +183,7 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 				continue
 			}
 
-			gateways := b.selectNetworkGateways(epNetwork, epCluster, requireHBONE)
+			gateways := b.selectNetworkGateways(epNetwork, epCluster, requireHBONE, ambientGws)
 			reachableGateways := b.filterGatewaysByIPFamily(gateways)
 
 			// Check if the endpoint is directly reachable. It's considered directly reachable if
@@ -330,12 +339,19 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 //  2. Enables Kubernetes MCS use cases, where endpoints for a service might be exported in one
 //     cluster but not another within the same network. By targeting the gateway for the cluster
 //     where the exported endpoints reside, we ensure that we only send traffic to exported endpoints.
-func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID, useHBONE bool) []model.NetworkGateway {
+//
+// ambientGws is the result of PushContext.AmbientNetworkGateways for this build. These are
+// gateways learned from the ambient index (for example from federation) rather than from the
+// mesh networks config or kube gateway services, and are only considered for HBONE.
+func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID, useHBONE bool, ambientGws []model.NetworkGateway) []model.NetworkGateway {
 	// Get the gateways for this network+cluster combination.
 	gws := b.gateways().GatewaysForNetworkAndCluster(nw, c)
 	if len(gws) == 0 {
 		// No match for network+cluster, just match the network.
 		gws = b.gateways().GatewaysForNetwork(nw)
+	}
+	if useHBONE {
+		gws = mergeGatewayLists(gws, selectGatewaysFromList(ambientGws, nw, c))
 	}
 
 	var filtered []model.NetworkGateway
@@ -369,6 +385,36 @@ func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID, use
 	}
 
 	return filtered
+}
+
+func selectGatewaysFromList(gws []model.NetworkGateway, nw network.ID, c cluster.ID) []model.NetworkGateway {
+	var networkAndClusterMatch []model.NetworkGateway
+	for _, gw := range gws {
+		if gw.Network == nw && gw.Cluster == c {
+			networkAndClusterMatch = append(networkAndClusterMatch, gw)
+		}
+	}
+	if len(networkAndClusterMatch) > 0 {
+		return model.SortGateways(networkAndClusterMatch)
+	}
+
+	var networkMatch []model.NetworkGateway
+	for _, gw := range gws {
+		if gw.Network == nw {
+			networkMatch = append(networkMatch, gw)
+		}
+	}
+	return model.SortGateways(networkMatch)
+}
+
+func mergeGatewayLists(primary, additional []model.NetworkGateway) []model.NetworkGateway {
+	if len(additional) == 0 {
+		return primary
+	}
+	merged := model.NetworkGatewaySet{}
+	merged.InsertAll(primary...)
+	merged.InsertAll(additional...)
+	return model.SortGateways(merged.UnsortedList())
 }
 
 func (b *EndpointBuilder) scaleEndpointLBWeight(ep *endpoint.LbEndpoint, scaleFactor uint32) uint32 {

@@ -755,6 +755,16 @@ func precomputeService(w *model.ServiceInfo) *model.ServiceInfo {
 	return w
 }
 
+// cloneServiceInfoPreservingMetadata returns a copy of si with a deep-copied
+// Service proto and the precomputed address cleared, keeping every other field.
+func cloneServiceInfoPreservingMetadata(si *model.ServiceInfo) *model.ServiceInfo {
+	w := *si
+	w.Service = protomarshal.Clone(w.Service)
+	w.AsAddress = model.AddressInfo{}
+	w.MarshaledAddress = nil
+	return &w
+}
+
 // setCanonical sets the canonical field in a WDS service without mangling the ServiceInfo.
 // It copies the ServiceInfo and clones the Service proto before modifying and precomputing the result.
 func setCanonical(se *model.ServiceInfo) *model.ServiceInfo {

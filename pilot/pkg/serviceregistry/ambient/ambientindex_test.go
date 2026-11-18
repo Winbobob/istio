@@ -2386,6 +2386,27 @@ func newAmbientTestServer(t *testing.T, clusterID cluster.ID, networkID network.
 }
 
 func newAmbientTestServerFromOptions(t *testing.T, networkID network.ID, options Options, runClient bool) *ambientTestServer {
+	if options.MultiClusterController == nil {
+		cl := kubeclient.NewFakeClient()
+		t.Cleanup(cl.Shutdown)
+		if options.MeshConfig == nil {
+			options.MeshConfig = meshwatcher.NewTestWatcher(nil)
+		}
+		if options.Debugger == nil {
+			options.Debugger = krt.GlobalDebugHandler
+		}
+		options.MultiClusterController = multicluster.NewController(multicluster.ControllerOptions{
+			Client:          cl,
+			ClusterID:       options.ClusterID,
+			SystemNamespace: systemNS,
+			MeshConfig:      options.MeshConfig,
+			ClientBuilder:   testingBuildClientsFromConfig(t),
+			Debugger:        options.Debugger,
+		})
+		if err := options.MultiClusterController.Run(test.NewStop(t)); err != nil {
+			t.Fatalf("failed to run multicluster controller: %v", err)
+		}
+	}
 	cl := options.MultiClusterController.ConfigCluster().Client()
 	for _, crd := range []schema.GroupVersionResource{
 		gvr.AuthorizationPolicy,
@@ -2496,8 +2517,6 @@ func newAmbientTestServerWithFlags(
 ) *ambientTestServer {
 	up := xdsfake.NewFakeXDS()
 	up.SplitEvents = true
-	cl := kubeclient.NewFakeClient()
-	t.Cleanup(cl.Shutdown)
 	debugger := krt.GlobalDebugHandler
 	config := mesh.DefaultMeshConfig()
 	if features.EnableAmbientMultiNetwork {
@@ -2529,31 +2548,16 @@ func newAmbientTestServerWithFlags(
 
 	meshConfig := meshwatcher.NewTestWatcher(config)
 
-	stop := test.NewStop(t)
-	mcOpts := multicluster.ControllerOptions{
-		Client:          cl,
-		ClusterID:       clusterID,
-		SystemNamespace: systemNS,
-		MeshConfig:      meshConfig,
-		ClientBuilder:   testingBuildClientsFromConfig(t),
-		Debugger:        debugger,
-	}
-
 	o := Options{
-		Revision:               revision,
-		SystemNamespace:        systemNS,
-		DomainSuffix:           "company.com",
-		ClusterID:              clusterID,
-		XDSUpdater:             up,
-		StatusNotifier:         activenotifier.New(true),
-		Debugger:               debugger,
-		Flags:                  flags,
-		MeshConfig:             meshConfig,
-		MultiClusterController: multicluster.NewController(mcOpts),
-	}
-
-	if err := o.MultiClusterController.Run(stop); err != nil {
-		t.Fatalf("failed to run multicluster controller: %v", err)
+		Revision:        revision,
+		SystemNamespace: systemNS,
+		DomainSuffix:    "company.com",
+		ClusterID:       clusterID,
+		XDSUpdater:      up,
+		StatusNotifier:  activenotifier.New(true),
+		Debugger:        debugger,
+		Flags:           flags,
+		MeshConfig:      meshConfig,
 	}
 
 	return newAmbientTestServerFromOptions(t, networkID, o, runClient)
